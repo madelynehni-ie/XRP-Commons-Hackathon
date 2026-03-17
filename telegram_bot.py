@@ -25,6 +25,12 @@ import logging
 import os
 from datetime import datetime, timezone
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv optional — can also export env vars manually
+
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -38,8 +44,7 @@ from telegram.ext import (
 # Config
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN",
-                               "8531459075:AAGt2Dab1rW98hFajCC41pYBy1uSSNjVURs")
+BOT_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALERTS_PATH   = "data/alerts.json"
 SUBS_PATH     = "data/subscribers.json"
 POLL_INTERVAL = 3   # seconds between alert checks

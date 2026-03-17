@@ -4,3 +4,4 @@ data/
 __pycache__/
 transactions.csv
 .DS_Store
+.env

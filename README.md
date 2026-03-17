@@ -89,6 +89,16 @@ python3 api.py
 
 Serves on `http://localhost:5000`. The Lovable frontend and Telegram bot both read from this API.
 
+### Start the Telegram bot
+
+```bash
+python3 telegram_bot.py
+```
+
+Users subscribe by clicking the deep link on the dashboard: `https://t.me/XRPL_Whale_WatchBot?start=1`
+
+The bot sends alerts directly to each subscriber's DMs based on their chosen severity threshold. Commands are available as inline keyboard buttons — no typing required.
+
 ---
 
 ## File Structure
@@ -416,6 +426,9 @@ This section is written for the Lovable AI frontend builder. It describes the ex
 
 The backend API runs locally at `http://localhost:5000`. All endpoints support CORS — no proxy needed. Poll every **5 seconds** for live data. Use `fetch` or `axios`.
 
+**Telegram bot deep link:** `https://t.me/XRPL_Whale_WatchBot?start=1`
+When a user clicks this link, Telegram opens the bot and automatically sends `/start` — they are subscribed immediately with no typing required.
+
 ```js
 const API = "http://localhost:5000"
 const refresh = () => {
@@ -464,6 +477,26 @@ refresh()
 │   └──────────────────────────┘                                         │
 └──────────────────────────────────────────────────────────────────────┘
 ```
+
+---
+
+### Telegram Subscribe Button
+
+Place this as a fixed CTA at the bottom of the page (and optionally in the header). It should always be visible.
+
+```jsx
+<a
+  href="https://t.me/XRPL_Whale_WatchBot?start=1"
+  target="_blank"
+  rel="noopener noreferrer"
+>
+  <button>
+    📲 Get Alerts on Telegram
+  </button>
+</a>
+```
+
+Style: dark button with Telegram blue (`#2AABEE`) border or background. Text: `📲 Get Alerts on Telegram`. On click, opens Telegram and auto-subscribes the user — no typing required.
 
 ---
 
@@ -752,6 +785,6 @@ Every scored transaction is passed to `buffer.add()`. Alert detectors then call 
 - [x] Alert storage (`alerts_writer.py` — atomic JSON, 500-entry rolling cap)
 - [x] Flask REST API (`api.py` — 6 endpoints, CORS enabled)
 - [ ] Lovable analytics dashboard
-- [ ] Telegram bot push notifications
+- [x] Telegram bot push notifications (`@XRPL_Whale_WatchBot`)
 - [ ] User-configurable alert thresholds
 - [ ] Cloud deployment

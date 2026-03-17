@@ -4,7 +4,10 @@ api.py — Flask REST API for the XRPL Whale Alert System
 Endpoints:
     GET /api/alerts          — recent alerts (supports ?limit=N&severity=high)
     GET /api/whales          — whale account list with stats
-    GET /api/stats           — live network summary from the transaction buffer
+    GET /api/whales/<acct>   — single account stats
+    GET /api/stats           — registry-level summary + alert breakdown
+    GET /api/network         — live 10-min rolling window stats (tx rate, anomaly rate, active whales)
+    GET /api/tokens          — per-token whale activity from the rolling window
     GET /api/health          — simple health check
 
 Usage:
@@ -141,6 +144,98 @@ def get_stats():
         "whale_threshold_tx_count": summary["whale_tx_threshold"],
         "total_alerts_stored": len(recent_alerts),
         "alert_type_breakdown": alert_counts,
+    })
+
+
+@app.get("/api/network")
+def get_network():
+    """Live rolling-window stats from the 10-min transaction buffer.
+
+    Returns real-time metrics: how busy the network is right now, how many
+    whales are active, and whether the anomaly rate is elevated.
+    """
+    net = _buffer.get_network_state()
+
+    # Which active accounts in the buffer are whales?
+    active_whale_accounts = [
+        acc for acc in _buffer.active_accounts
+        if _registry.is_whale(acc)
+    ]
+
+    # Anomaly rate as a percentage
+    anomaly_rate = (
+        round(net.anomaly_count / net.tx_count * 100, 1)
+        if net.tx_count > 0 else 0.0
+    )
+
+    # Recent alert rate: alerts fired in the last 10 minutes
+    recent_alerts = read_alerts(limit=500)
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=10)
+    recent_count = sum(
+        1 for a in recent_alerts
+        if a.get("timestamp") and a["timestamp"] >= cutoff.isoformat()
+    )
+
+    return jsonify({
+        "window_minutes": 10,
+        "tx_count": net.tx_count,
+        "active_accounts": net.active_accounts,
+        "active_whale_count": len(active_whale_accounts),
+        "active_whale_accounts": active_whale_accounts[:20],  # cap for payload size
+        "total_xrp_volume": round(net.total_xrp_volume, 2),
+        "avg_risk_score": round(net.avg_risk_score, 4),
+        "anomaly_count": net.anomaly_count,
+        "anomaly_rate_pct": anomaly_rate,
+        "alerts_last_10min": recent_count,
+    })
+
+
+@app.get("/api/tokens")
+def get_tokens():
+    """Per-token whale activity from the rolling 10-min window.
+
+    For each token that at least one whale has traded in the last 10 minutes,
+    returns the count of active whales, total offer activity, and which
+    whale accounts are involved.
+    """
+    # Scan every tx in the buffer — build token → whale activity map
+    token_whales: dict[str, set] = {}
+    token_offers: dict[str, int] = {}
+
+    for tx in _buffer._buffer:
+        acc = tx.get("account")
+        currency = tx.get("currency") or "XRP"
+        tx_type = tx.get("tx_type") or ""
+
+        if currency == "XRP" or tx_type not in ("OfferCreate", "OfferCancel"):
+            continue
+        if not _registry.is_whale(acc):
+            continue
+
+        if currency not in token_whales:
+            token_whales[currency] = set()
+            token_offers[currency] = 0
+
+        token_whales[currency].add(acc)
+        token_offers[currency] += 1
+
+    # Build response — sort by whale count descending
+    tokens = [
+        {
+            "token": currency,
+            "whale_count": len(whales),
+            "whale_accounts": list(whales),
+            "offer_count": token_offers[currency],
+        }
+        for currency, whales in token_whales.items()
+    ]
+    tokens.sort(key=lambda t: t["whale_count"], reverse=True)
+
+    return jsonify({
+        "window_minutes": 10,
+        "active_token_count": len(tokens),
+        "tokens": tokens,
     })
 
 

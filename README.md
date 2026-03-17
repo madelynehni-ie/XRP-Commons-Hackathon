@@ -103,7 +103,7 @@ Serves on `http://localhost:5000`. The Lovable frontend and Telegram bot both re
 ├── transaction_buffer.py         # 10-min rolling window, per-account state, cooldowns
 ├── alert_engine.py               # 15 alert types — fires on every scored transaction
 ├── alerts_writer.py              # Writes/reads data/alerts.json (thread-safe)
-├── api.py                        # Flask REST API for frontend + Telegram bot
+├── api.py                        # Flask REST API — 6 endpoints, CORS enabled
 ├── telegram_bot.py               # ← TODO: Telegram push notifications
 ├── requirements.txt
 ├── models/
@@ -281,6 +281,56 @@ Returns a high-level system summary: registry stats and alert breakdown.
 
 ---
 
+### `GET /api/network`
+
+Live rolling-window stats from the 10-minute transaction buffer. Use this to power the "right now" metrics panel — how busy the network is, how many whales are active, and whether the anomaly rate is elevated.
+
+**Response**
+```json
+{
+  "window_minutes": 10,
+  "tx_count": 1240,
+  "active_accounts": 87,
+  "active_whale_count": 14,
+  "active_whale_accounts": ["rWDwq...", "rHb9C...", "rPT1J..."],
+  "total_xrp_volume": 842300.5,
+  "avg_risk_score": 0.38,
+  "anomaly_count": 62,
+  "anomaly_rate_pct": 5.0,
+  "alerts_last_10min": 7
+}
+```
+
+---
+
+### `GET /api/tokens`
+
+Per-token whale activity from the rolling 10-min window. Only includes tokens where at least one whale has placed or cancelled an offer. Use this to power the token heatmap — which tokens are whales most active on right now.
+
+**Response**
+```json
+{
+  "window_minutes": 10,
+  "active_token_count": 4,
+  "tokens": [
+    {
+      "token": "SOLO",
+      "whale_count": 5,
+      "whale_accounts": ["rWDwq...", "rHb9C...", "rPT1J...", "rG1Qu...", "rN7n4..."],
+      "offer_count": 48
+    },
+    {
+      "token": "RLUSD",
+      "whale_count": 3,
+      "whale_accounts": ["rWDwq...", "rHb9C...", "rG1Qu..."],
+      "offer_count": 21
+    }
+  ]
+}
+```
+
+---
+
 ## Alert Reference
 
 Every alert has the following shape:
@@ -355,6 +405,199 @@ Severity is set by the ML risk score:
 | `WALLET_DRAIN` | Whale account's total XRP out in the window reaches ≥ 80% of its full historical XRP sent | `⚠️ Wallet drain: 9400.0 XRP (87.3% of historical) in last 10 min` |
 | `BEHAVIOUR_SHIFT` | Whale account has ≥ 10 txs in the window and its dominant transaction type has changed from its historical baseline | `🔄 Behaviour shift: switched from Payment to OfferCreate` |
 | `NEW_WHALE_EMERGENCE` | A non-whale account's session transaction count crosses the whale threshold (144 txs) | `🆕 New whale emerging: 145 txs in session` |
+
+---
+
+## Frontend Guide (Lovable)
+
+This section is written for the Lovable AI frontend builder. It describes the exact layout, data sources, and behaviour we want for each part of the dashboard.
+
+### Setup
+
+The backend API runs locally at `http://localhost:5000`. All endpoints support CORS — no proxy needed. Poll every **5 seconds** for live data. Use `fetch` or `axios`.
+
+```js
+const API = "http://localhost:5000"
+const refresh = () => {
+  fetch(`${API}/api/alerts?limit=20`).then(r => r.json()).then(setAlerts)
+  fetch(`${API}/api/network`).then(r => r.json()).then(setNetwork)
+  fetch(`${API}/api/tokens`).then(r => r.json()).then(setTokens)
+}
+setInterval(refresh, 5000)
+refresh()
+```
+
+---
+
+### Visual Style
+
+- **Theme:** Dark background (near-black, e.g. `#0d0f14`). This is a monitoring tool — dark mode only.
+- **Accent colours:** Use the severity colour system consistently everywhere:
+  - `critical` → red (`#ef4444`)
+  - `high` → orange (`#f97316`)
+  - `medium` → yellow (`#eab308`)
+  - `low` → blue-grey (`#64748b`)
+- **Font:** Monospace for addresses and numbers (e.g. `font-mono`). Sans-serif for labels and headings.
+- **Layout:** Full-width dashboard. No sidebar. Cards arranged in a responsive grid.
+- **Tone:** Data-dense but readable. Think Bloomberg terminal meets modern SaaS.
+
+---
+
+### Page Layout
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Header: "🐋 XRPL Whale Monitor"   [live indicator dot]  [time]      │
+├────────────┬────────────┬────────────┬────────────┬──────────────────┤
+│  Whales    │  Txs (10m) │  Anomaly % │  Alerts    │  Active Tokens   │
+│  Active    │  in window │  rate      │  (10 min)  │  (whale trades)  │
+├────────────┴────────────┴────────────┴────────────┴──────────────────┤
+│                                                                        │
+│   LEFT (60%)                        RIGHT (40%)                        │
+│   ┌──────────────────────────┐      ┌──────────────────────────────┐  │
+│   │  Live Alert Feed         │      │  Token Heatmap               │  │
+│   │  (scrolling list)        │      │  (which tokens whales trade) │  │
+│   └──────────────────────────┘      ├──────────────────────────────┤  │
+│   ┌──────────────────────────┐      │  Whale Leaderboard           │  │
+│   │  Alert Type Breakdown    │      │  (top 10 most active whales) │  │
+│   │  (bar chart)             │      └──────────────────────────────┘  │
+│   └──────────────────────────┘                                         │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Component 1 — Header
+
+A single top bar with:
+- App name: **"🐋 XRPL Whale Monitor"**
+- A pulsing green dot labelled **"LIVE"** when data is fresh (last fetch < 10s ago), grey **"OFFLINE"** otherwise
+- Current UTC time (update every second)
+
+---
+
+### Component 2 — Stats Row (5 KPI cards)
+
+Poll: `GET /api/network` every 5 seconds.
+
+| Card | Field | Label | Format |
+|------|-------|-------|--------|
+| Whales Active | `active_whale_count` | Whales Active (10 min) | Number, large font |
+| Transactions | `tx_count` | Txs in Last 10 Min | Number with comma separator |
+| Anomaly Rate | `anomaly_rate_pct` | Anomaly Rate | `X.X%` — colour red if > 10% |
+| Alerts Fired | `alerts_last_10min` | Alerts (10 min) | Number — colour orange if > 0 |
+| Avg Risk Score | `avg_risk_score` | Avg Risk Score | `0.XX` — colour red if > 0.6 |
+
+---
+
+### Component 3 — Live Alert Feed
+
+Poll: `GET /api/alerts?limit=20` every 5 seconds.
+
+Display as a scrolling card list, newest at the top. Each alert card shows:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  [CRITICAL]  TOKEN_ACCUMULATION          2 min ago  │
+│  🐋 Whale active on SOLO: 12 offers in last 10 min  │
+│  Account: rWDwq...FooZ    Risk: 0.87  [anomaly]     │
+└─────────────────────────────────────────────────────┘
+```
+
+- Left-border colour matches severity (red / orange / yellow / grey)
+- Severity badge in the top-left (coloured pill)
+- Alert type in monospace, timestamp relative (e.g. "2 min ago")
+- Message in plain text — this is the main content, make it readable
+- Account address truncated to `rXXXX...XXXX` (first 6, last 4 chars)
+- Risk score shown as a number; if `is_anomaly = 1`, show a small red "anomaly" badge
+- Clicking an alert card should open a detail drawer/modal showing the full `details` object as formatted key-value pairs
+
+**Alert type → emoji mapping** (already in the message, but use for icons too):
+- `LARGE_XRP_TRANSFER` → 🐋
+- `VOLUME_SPIKE` → 📈
+- `HIGH_RISK_TRANSACTION` → ⚠️
+- `TRANSACTION_BURST` → ⚡
+- `ABNORMAL_TX_RATE` → 🤖
+- `TOKEN_ACCUMULATION` → 🐋
+- `OFFER_CANCEL_SPIKE` → 👻
+- `MULTI_WHALE_CONVERGENCE` → 🔥
+- `MEMO_SPAM` → 📨
+- `URL_SPAM` → 🔗
+- `HIGH_ENTROPY_MEMO` → 🔐
+- `WALLET_DRAIN` → ⚠️
+- `BEHAVIOUR_SHIFT` → 🔄
+- `NEW_WHALE_EMERGENCE` → 🆕
+
+---
+
+### Component 4 — Alert Type Breakdown
+
+Poll: `GET /api/stats` every 10 seconds.
+
+Use `alert_type_breakdown` to render a horizontal bar chart showing how many times each alert type has fired in total. Sort by count descending. Colour bars by the typical severity of that alert type:
+
+- `HIGH_RISK_TRANSACTION`, `WALLET_DRAIN`, `MULTI_WHALE_CONVERGENCE` → red
+- `TOKEN_ACCUMULATION`, `TRANSACTION_BURST`, `ABNORMAL_TX_RATE`, `BEHAVIOUR_SHIFT` → orange
+- `OFFER_CANCEL_SPIKE`, `MEMO_SPAM`, `URL_SPAM`, `HIGH_ENTROPY_MEMO` → yellow
+- `VOLUME_SPIKE`, `LARGE_XRP_TRANSFER`, `NEW_WHALE_EMERGENCE` → blue
+
+---
+
+### Component 5 — Token Heatmap
+
+Poll: `GET /api/tokens` every 5 seconds.
+
+Show each active token as a card/tile. Sort by `whale_count` descending.
+
+```
+┌─────────────────────────────────┐
+│  SOLO                           │
+│  ████████████  5 whales         │
+│  48 offers in last 10 min       │
+└─────────────────────────────────┘
+```
+
+- Token name large and prominent
+- A mini bar or dot indicators for whale count (max 10 dots)
+- Offer count as secondary info
+- Highlight the top token with a gold border or glow effect
+- If no tokens are active, show: "No whale token activity in the last 10 minutes"
+
+---
+
+### Component 6 — Whale Leaderboard
+
+Poll: `GET /api/whales?limit=10&sort=tx_count` once on load (historical data, no need to poll frequently).
+
+Show the top 10 whales as a ranked table:
+
+| # | Account | Tx Count | Top Activity | Tokens Traded | Percentile |
+|---|---------|----------|-------------|---------------|------------|
+| 1 | rWDwq...FooZ | 35,201 | OfferCreate | SOLO, RLUSD | Top 0.03% |
+| 2 | rHb9C...XYZa | 31,450 | OfferCreate | XRPH, SOLO | Top 0.05% |
+
+- Rank number on the left (1, 2, 3...)
+- Account address truncated and monospaced (`rXXXX...XXXX`)
+- "Top Activity" = the tx_type with the highest count from `tx_types`
+- "Tokens Traded" = first 3 tokens from `tokens_traded`, then "+ N more" if there are more
+- "Percentile" = `(1 - percentile) * 100` formatted as "Top X.XX%"
+- Clicking a row opens a detail card/modal using `GET /api/whales/<account>`
+
+**Whale detail modal** (on row click):
+- Full address (copyable)
+- Historical tx count, XRP sent, XRP received
+- Bar chart of tx type breakdown (from `tx_types`)
+- All tokens ever traded
+- Recent alerts for this account (filter `GET /api/alerts` by account client-side)
+
+---
+
+### Data Freshness & Error States
+
+- If any fetch fails, show a subtle "⚠ Data may be stale" warning in the header — do not crash or show empty components
+- If `alerts` array is empty, show: "No alerts yet — waiting for whale activity..."
+- If `tokens` array is empty, show: "No whale token activity in the last 10 minutes"
+- If `active_whale_count` is 0, the network stats row should still render (show 0s, not blank)
 
 ---
 
@@ -507,8 +750,8 @@ Every scored transaction is passed to `buffer.add()`. Alert detectors then call 
 - [x] Transaction buffer (10-min rolling window, per-account state, cooldowns)
 - [x] Alert engine (15 alert types across 5 groups)
 - [x] Alert storage (`alerts_writer.py` — atomic JSON, 500-entry rolling cap)
-- [x] Flask REST API (`api.py` — 4 endpoints, CORS enabled)
-- [ ] Telegram bot push notifications
+- [x] Flask REST API (`api.py` — 6 endpoints, CORS enabled)
 - [ ] Lovable analytics dashboard
+- [ ] Telegram bot push notifications
 - [ ] User-configurable alert thresholds
 - [ ] Cloud deployment

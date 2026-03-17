@@ -12,8 +12,8 @@ Architecture:
             ├── Group 1: Size & Whale Movements
             ├── Group 2: Burst & Bot Activity
             ├── Group 3: DEX & Trading Activity
-            ├── Group 4: Memo & Spam Detection       [coming soon]
-            └── Group 5: Account Behaviour Shifts    [coming soon]
+            ├── Group 4: Memo & Spam Detection
+            └── Group 5: Account Behaviour Shifts
 
 Usage:
     from whale_registry import WhaleRegistry
@@ -59,6 +59,16 @@ TOKEN_OFFER_MIN         = 5      # min OfferCreates for same token to fire TOKEN
 CANCEL_RATIO_THRESHOLD  = 0.7    # offer_cancel_ratio above which we fire OFFER_CANCEL_SPIKE
 CANCEL_MIN_OFFERS       = 5      # min total offers before cancel ratio is meaningful
 MULTI_WHALE_MIN         = 3      # min whales on same token to fire MULTI_WHALE_CONVERGENCE
+
+# Group 4
+MEMO_SPAM_MIN           = 10     # min duplicate memos to fire MEMO_SPAM
+MEMO_ENTROPY_HIGH       = 4.5    # Shannon entropy above which we fire HIGH_ENTROPY_MEMO
+URL_SPAM_TX_MIN         = 5      # min txs with URLs to fire URL_SPAM
+
+# Group 5
+WALLET_DRAIN_THRESHOLD  = 0.8    # fraction of historical XRP volume sent in window to fire WALLET_DRAIN
+BEHAVIOUR_SHIFT_MIN_TXS = 10     # min txs in window before we check for behaviour shift
+BEHAVIOUR_SHIFT_DELTA   = 0.5    # cosine-distance-equivalent change in tx-type mix to fire alert
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +183,15 @@ class AlertEngine:
         alerts += self._check_offer_cancel_spike(scored_tx)
         alerts += self._check_multi_whale_convergence(scored_tx)
 
-        # Groups 4–5 will be added here in subsequent steps
+        # Group 4 — Memo & Spam Detection
+        alerts += self._check_memo_spam(scored_tx)
+        alerts += self._check_url_spam(scored_tx)
+        alerts += self._check_high_entropy_memo(scored_tx)
+
+        # Group 5 — Account Behaviour Shifts
+        alerts += self._check_wallet_drain(scored_tx)
+        alerts += self._check_behaviour_shift(scored_tx)
+        alerts += self._check_new_whale_emergence(scored_tx)
 
         return alerts
 
@@ -638,4 +656,338 @@ class AlertEngine:
         )
 
         self.buffer.set_cooldown(cooldown_key, "MULTI_WHALE_CONVERGENCE")
+        return [alert]
+
+    # ── Group 4: Memo & Spam Detection ───────────────────────────────────
+
+    def _check_memo_spam(self, tx: dict) -> list[Alert]:
+        """
+        MEMO_SPAM — an account is sending transactions with identical memo content,
+        a pattern associated with spam campaigns or airdrop flooding.
+
+        Fires when:
+          - duplicate_memo_count >= MEMO_SPAM_MIN (10)
+          - Not on cooldown
+        No whale check — spam can come from any account.
+        """
+        account   = tx.get("account", "")
+        dup_count = float(tx.get("duplicate_memo_count") or 0)
+        risk      = float(tx.get("risk_score") or 0)
+        anomaly   = int(tx.get("is_anomaly") or 0)
+
+        if dup_count < MEMO_SPAM_MIN:
+            return []
+        if self.buffer.is_on_cooldown(account, "MEMO_SPAM"):
+            return []
+
+        severity = _severity(risk, anomaly)
+        message = (
+            f"📨 Memo spam: {account[:12]}... sent {int(dup_count)} transactions "
+            f"with identical memo content"
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="MEMO_SPAM",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "duplicate_memo_count": int(dup_count),
+                "memo_spam_threshold": MEMO_SPAM_MIN,
+            },
+        )
+
+        self.buffer.set_cooldown(account, "MEMO_SPAM")
+        return [alert]
+
+    def _check_url_spam(self, tx: dict) -> list[Alert]:
+        """
+        URL_SPAM — an account is embedding URLs in memo fields across multiple
+        transactions, consistent with phishing or advertising campaigns.
+
+        Fires when:
+          - contains_url = 1
+          - Account has sent >= URL_SPAM_TX_MIN transactions with URLs in the buffer
+          - Not on cooldown
+        """
+        account     = tx.get("account", "")
+        contains_url = int(tx.get("contains_url") or 0)
+        risk        = float(tx.get("risk_score") or 0)
+        anomaly     = int(tx.get("is_anomaly") or 0)
+
+        if not contains_url:
+            return []
+        if self.buffer.is_on_cooldown(account, "URL_SPAM"):
+            return []
+
+        # Count how many URL-containing txs this account has in the buffer
+        url_tx_count = sum(
+            1 for t in self.buffer._buffer
+            if t.get("account") == account and int(t.get("contains_url") or 0) == 1
+        )
+
+        if url_tx_count < URL_SPAM_TX_MIN:
+            return []
+
+        severity = _severity(risk, anomaly)
+        message = (
+            f"🔗 URL spam: {account[:12]}... embedded URLs in "
+            f"{url_tx_count} transaction memos"
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="URL_SPAM",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "url_tx_count": url_tx_count,
+                "url_spam_threshold": URL_SPAM_TX_MIN,
+            },
+        )
+
+        self.buffer.set_cooldown(account, "URL_SPAM")
+        return [alert]
+
+    def _check_high_entropy_memo(self, tx: dict) -> list[Alert]:
+        """
+        HIGH_ENTROPY_MEMO — memo content has very high Shannon entropy,
+        consistent with encrypted payloads, binary data, or obfuscated content.
+
+        Fires when:
+          - memo_entropy >= MEMO_ENTROPY_HIGH (4.5 bits/char)
+          - memo_length > 0 (there is actually a memo)
+          - Not on cooldown
+        """
+        account  = tx.get("account", "")
+        entropy  = float(tx.get("memo_entropy") or 0)
+        length   = float(tx.get("memo_length") or 0)
+        risk     = float(tx.get("risk_score") or 0)
+        anomaly  = int(tx.get("is_anomaly") or 0)
+
+        if entropy < MEMO_ENTROPY_HIGH or length == 0:
+            return []
+        if self.buffer.is_on_cooldown(account, "HIGH_ENTROPY_MEMO"):
+            return []
+
+        severity = _severity(risk, anomaly)
+        message = (
+            f"🔐 High-entropy memo from {account[:12]}... — "
+            f"possible encrypted or binary payload (entropy: {entropy:.2f})"
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="HIGH_ENTROPY_MEMO",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "memo_entropy": round(entropy, 3),
+                "memo_length": int(length),
+                "entropy_threshold": MEMO_ENTROPY_HIGH,
+            },
+        )
+
+        self.buffer.set_cooldown(account, "HIGH_ENTROPY_MEMO")
+        return [alert]
+
+    # ── Group 5: Account Behaviour Shifts ────────────────────────────────
+
+    def _check_wallet_drain(self, tx: dict) -> list[Alert]:
+        """
+        WALLET_DRAIN — a whale is sending out a large fraction of their
+        historical XRP volume in a short window, suggesting a potential exit.
+
+        Fires when:
+          - Account is a whale
+          - xrp_out in the current window >= WALLET_DRAIN_THRESHOLD (80%)
+            of the account's total historical xrp_sent
+          - xrp_out > 0 (something is actually being sent)
+          - Not on cooldown
+        """
+        account = tx.get("account", "")
+        risk    = float(tx.get("risk_score") or 0)
+        anomaly = int(tx.get("is_anomaly") or 0)
+
+        if not self.registry.is_whale(account):
+            return []
+        if self.buffer.is_on_cooldown(account, "WALLET_DRAIN"):
+            return []
+
+        state      = self.buffer.get_account_state(account)
+        hist_stats = self.registry.get_stats(account)
+
+        if state.xrp_out <= 0 or hist_stats is None:
+            return []
+
+        historical_sent = hist_stats.xrp_sent
+        if historical_sent <= 0:
+            return []
+
+        drain_ratio = state.xrp_out / historical_sent
+        if drain_ratio < WALLET_DRAIN_THRESHOLD:
+            return []
+
+        severity = _severity(risk, anomaly)
+        message = (
+            f"⚠️ Wallet drain: {account[:12]}... sent {_fmt_amount(state.xrp_out, 'XRP')} "
+            f"({drain_ratio*100:.0f}% of historical volume) in last 10 min"
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="WALLET_DRAIN",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "xrp_out_window": round(state.xrp_out, 4),
+                "historical_xrp_sent": round(historical_sent, 4),
+                "drain_ratio": round(drain_ratio, 3),
+                "drain_threshold": WALLET_DRAIN_THRESHOLD,
+            },
+        )
+
+        self.buffer.set_cooldown(account, "WALLET_DRAIN")
+        return [alert]
+
+    def _check_behaviour_shift(self, tx: dict) -> list[Alert]:
+        """
+        BEHAVIOUR_SHIFT — a whale's transaction type mix in the current window
+        is significantly different from their historical baseline.
+
+        Fires when:
+          - Account is a whale
+          - >= BEHAVIOUR_SHIFT_MIN_TXS transactions in the window
+          - The dominant tx_type in the window differs from the historical dominant type
+            AND the shift is significant (window dominant type > BEHAVIOUR_SHIFT_DELTA fraction)
+          - Not on cooldown
+        """
+        account = tx.get("account", "")
+        risk    = float(tx.get("risk_score") or 0)
+        anomaly = int(tx.get("is_anomaly") or 0)
+
+        if not self.registry.is_whale(account):
+            return []
+        if self.buffer.is_on_cooldown(account, "BEHAVIOUR_SHIFT"):
+            return []
+
+        state      = self.buffer.get_account_state(account)
+        hist_stats = self.registry.get_stats(account)
+
+        if state.tx_count < BEHAVIOUR_SHIFT_MIN_TXS or hist_stats is None:
+            return []
+        if not state.tx_types or not hist_stats.tx_types:
+            return []
+
+        # Dominant type in the current window
+        window_dominant = max(state.tx_types, key=state.tx_types.get)
+        window_fraction = state.tx_types[window_dominant] / state.tx_count
+
+        # Dominant type historically
+        hist_total = sum(hist_stats.tx_types.values())
+        if hist_total == 0:
+            return []
+        hist_dominant = max(hist_stats.tx_types, key=hist_stats.tx_types.get)
+
+        # Only alert if the dominant type has changed AND it's significant
+        if window_dominant == hist_dominant:
+            return []
+        if window_fraction < BEHAVIOUR_SHIFT_DELTA:
+            return []
+
+        severity = _severity(risk, anomaly)
+        message = (
+            f"🔄 Behaviour shift: {account[:12]}... switched from "
+            f"{hist_dominant} to {window_dominant} "
+            f"({window_fraction*100:.0f}% of recent activity)"
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="BEHAVIOUR_SHIFT",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "historical_dominant_type": hist_dominant,
+                "window_dominant_type": window_dominant,
+                "window_fraction": round(window_fraction, 3),
+                "window_tx_types": state.tx_types,
+            },
+        )
+
+        self.buffer.set_cooldown(account, "BEHAVIOUR_SHIFT")
+        return [alert]
+
+    def _check_new_whale_emergence(self, tx: dict) -> list[Alert]:
+        """
+        NEW_WHALE_EMERGENCE — an account not in the historical whale registry
+        is showing whale-level activity in the current session.
+
+        Fires when:
+          - Account is NOT in the historical whale registry
+          - The account's tx_count in the buffer >= whale threshold
+          - Not on cooldown
+
+        This catches new high-volume accounts that weren't present in the
+        training data — emerging players entering the market.
+        """
+        account = tx.get("account", "")
+        risk    = float(tx.get("risk_score") or 0)
+        anomaly = int(tx.get("is_anomaly") or 0)
+
+        # Only fire for accounts NOT already classified as whales
+        if self.registry.is_whale(account):
+            return []
+        if self.buffer.is_on_cooldown(account, "NEW_WHALE_EMERGENCE"):
+            return []
+
+        state = self.buffer.get_account_state(account)
+        threshold = self.registry.whale_tx_threshold
+
+        if state.tx_count < threshold:
+            return []
+
+        severity = _severity(risk, anomaly)
+        message = (
+            f"🆕 New whale emerging: {account[:12]}... reached {state.tx_count} txs "
+            f"in this session (threshold: {threshold})"
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="NEW_WHALE_EMERGENCE",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "session_tx_count": state.tx_count,
+                "whale_threshold": threshold,
+                "xrp_out": round(state.xrp_out, 4),
+            },
+        )
+
+        self.buffer.set_cooldown(account, "NEW_WHALE_EMERGENCE")
         return [alert]

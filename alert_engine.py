@@ -11,7 +11,7 @@ Architecture:
         └── Detectors (one per alert group)
             ├── Group 1: Size & Whale Movements
             ├── Group 2: Burst & Bot Activity
-            ├── Group 3: DEX & Trading Activity      [coming soon]
+            ├── Group 3: DEX & Trading Activity
             ├── Group 4: Memo & Spam Detection       [coming soon]
             └── Group 5: Account Behaviour Shifts    [coming soon]
 
@@ -53,6 +53,12 @@ CRITICAL_RISK_THRESHOLD = 0.9    # risk_score above which severity is critical
 # Group 2
 BURST_TX_COUNT          = 50     # rolling_tx_count_5m above which we fire TRANSACTION_BURST
 BURST_Z_SCORE           = 3.0    # tx_rate_z_score above which we fire ABNORMAL_TX_RATE
+
+# Group 3
+TOKEN_OFFER_MIN         = 5      # min OfferCreates for same token to fire TOKEN_ACCUMULATION/FLASH_DUMP
+CANCEL_RATIO_THRESHOLD  = 0.7    # offer_cancel_ratio above which we fire OFFER_CANCEL_SPIKE
+CANCEL_MIN_OFFERS       = 5      # min total offers before cancel ratio is meaningful
+MULTI_WHALE_MIN         = 3      # min whales on same token to fire MULTI_WHALE_CONVERGENCE
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +168,12 @@ class AlertEngine:
         alerts += self._check_transaction_burst(scored_tx)
         alerts += self._check_abnormal_tx_rate(scored_tx)
 
-        # Groups 3–5 will be added here in subsequent steps
+        # Group 3 — DEX & Trading Activity
+        alerts += self._check_token_accumulation(scored_tx)
+        alerts += self._check_offer_cancel_spike(scored_tx)
+        alerts += self._check_multi_whale_convergence(scored_tx)
+
+        # Groups 4–5 will be added here in subsequent steps
 
         return alerts
 
@@ -427,4 +438,204 @@ class AlertEngine:
         )
 
         self.buffer.set_cooldown(account, "ABNORMAL_TX_RATE")
+        return [alert]
+
+    # ── Group 3: DEX & Trading Activity ──────────────────────────────────
+
+    def _check_token_accumulation(self, tx: dict) -> list[Alert]:
+        """
+        TOKEN_ACCUMULATION / FLASH_DUMP — a whale is repeatedly trading
+        the same token in the same direction within the rolling window.
+
+        Fires TOKEN_ACCUMULATION when:
+          - Account is a whale
+          - tx_type is OfferCreate
+          - The same non-XRP currency appears >= TOKEN_OFFER_MIN times
+            in the account's recent OfferCreates (from the buffer)
+          - Not on cooldown for TOKEN_ACCUMULATION or FLASH_DUMP
+
+        Since the normalised schema captures the currency of the traded amount,
+        repeated OfferCreates for the same currency signal accumulation activity.
+        We fire FLASH_DUMP under the same logic — repeated offers on a token
+        are directional activity regardless of buy/sell side.
+        """
+        account = tx.get("account", "")
+        tx_type = tx.get("tx_type", "")
+        currency = tx.get("currency") or ""
+        risk    = float(tx.get("risk_score") or 0)
+        anomaly = int(tx.get("is_anomaly") or 0)
+
+        if not self.registry.is_whale(account):
+            return []
+        if tx_type != "OfferCreate":
+            return []
+        if not currency or currency == "XRP":
+            return []
+
+        # Count recent OfferCreates for this specific currency in the buffer
+        offer_count = sum(
+            1 for t in self.buffer._buffer
+            if t.get("account") == account
+            and t.get("tx_type") == "OfferCreate"
+            and t.get("currency") == currency
+        )
+
+        if offer_count < TOKEN_OFFER_MIN:
+            return []
+
+        alert_type = "TOKEN_ACCUMULATION"
+        if self.buffer.is_on_cooldown(account, alert_type):
+            return []
+
+        severity = _severity(risk, anomaly)
+        token_short = currency[:10]
+        message = (
+            f"🐋 Whale active on {token_short}: "
+            f"{offer_count} offers in last 10 min from {account[:12]}..."
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type=alert_type,
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "token": currency,
+                "offer_count": offer_count,
+                "min_offers_threshold": TOKEN_OFFER_MIN,
+            },
+        )
+
+        self.buffer.set_cooldown(account, alert_type)
+        return [alert]
+
+    def _check_offer_cancel_spike(self, tx: dict) -> list[Alert]:
+        """
+        OFFER_CANCEL_SPIKE — a whale is placing and cancelling offers at a
+        suspicious ratio, a classic spoofing / order-book manipulation pattern.
+
+        Fires when:
+          - Account is a whale
+          - tx_type is OfferCancel
+          - offer_cancel_ratio (from AccountState) >= CANCEL_RATIO_THRESHOLD (0.7)
+          - Total offers in window >= CANCEL_MIN_OFFERS (avoids noise on small samples)
+          - Not on cooldown
+        """
+        account = tx.get("account", "")
+        tx_type = tx.get("tx_type", "")
+        risk    = float(tx.get("risk_score") or 0)
+        anomaly = int(tx.get("is_anomaly") or 0)
+
+        if not self.registry.is_whale(account):
+            return []
+        if tx_type != "OfferCancel":
+            return []
+        if self.buffer.is_on_cooldown(account, "OFFER_CANCEL_SPIKE"):
+            return []
+
+        state = self.buffer.get_account_state(account)
+        total_offers = state.offer_creates + state.offer_cancels
+
+        if total_offers < CANCEL_MIN_OFFERS:
+            return []
+        if state.offer_cancel_ratio < CANCEL_RATIO_THRESHOLD:
+            return []
+
+        severity = _severity(risk, anomaly)
+        pct = int(state.offer_cancel_ratio * 100)
+        message = (
+            f"👻 Possible spoofing: {account[:12]}... cancelled {pct}% of offers "
+            f"({state.offer_cancels} cancels / {total_offers} total)"
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="OFFER_CANCEL_SPIKE",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "offer_creates": state.offer_creates,
+                "offer_cancels": state.offer_cancels,
+                "cancel_ratio": round(state.offer_cancel_ratio, 3),
+                "cancel_ratio_threshold": CANCEL_RATIO_THRESHOLD,
+            },
+        )
+
+        self.buffer.set_cooldown(account, "OFFER_CANCEL_SPIKE")
+        return [alert]
+
+    def _check_multi_whale_convergence(self, tx: dict) -> list[Alert]:
+        """
+        MULTI_WHALE_CONVERGENCE — multiple whales are trading the same token
+        simultaneously, a signal of coordinated activity.
+
+        Fires when:
+          - tx_type is OfferCreate
+          - Currency is non-XRP
+          - >= MULTI_WHALE_MIN distinct whale accounts have OfferCreates
+            for this same currency in the current buffer window
+          - Not on network-level cooldown for this token
+
+        Cooldown key is ("TOKEN:{currency}", "MULTI_WHALE_CONVERGENCE") so
+        each token has its own independent cooldown.
+        """
+        tx_type  = tx.get("tx_type", "")
+        currency = tx.get("currency") or ""
+        risk     = float(tx.get("risk_score") or 0)
+        anomaly  = int(tx.get("is_anomaly") or 0)
+
+        if tx_type != "OfferCreate":
+            return []
+        if not currency or currency == "XRP":
+            return []
+
+        cooldown_key = f"TOKEN:{currency}"
+        if self.buffer.is_on_cooldown(cooldown_key, "MULTI_WHALE_CONVERGENCE"):
+            return []
+
+        # Count distinct whale accounts offering this currency in the window
+        whale_accounts_on_token = set(
+            t.get("account") for t in self.buffer._buffer
+            if t.get("tx_type") == "OfferCreate"
+            and t.get("currency") == currency
+            and self.registry.is_whale(t.get("account", ""))
+        )
+
+        if len(whale_accounts_on_token) < MULTI_WHALE_MIN:
+            return []
+
+        severity = _severity(risk, anomaly)
+        token_short = currency[:10]
+        n = len(whale_accounts_on_token)
+        message = (
+            f"🔥 {n} whales trading {token_short} simultaneously — "
+            f"coordinated activity detected"
+        )
+
+        alert = Alert(
+            id=_make_id("NETWORK"),
+            timestamp=_now_iso(),
+            account="NETWORK",
+            alert_type="MULTI_WHALE_CONVERGENCE",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "token": currency,
+                "whale_count": n,
+                "whale_accounts": list(whale_accounts_on_token),
+                "min_whales_threshold": MULTI_WHALE_MIN,
+            },
+        )
+
+        self.buffer.set_cooldown(cooldown_key, "MULTI_WHALE_CONVERGENCE")
         return [alert]

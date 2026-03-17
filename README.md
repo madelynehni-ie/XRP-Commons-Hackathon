@@ -107,6 +107,45 @@ Connects to `wss://xrplcluster.com/` and for every live transaction:
 
 ---
 
+## Whale Registry (`whale_registry.py`)
+
+Identifies whale accounts from historical data before any alert logic runs. Everything in the alert engine checks against this registry first.
+
+**How it works:**
+
+1. Loads transaction data (featured CSV if available, raw CSV otherwise)
+2. Computes per-account statistics across all 271,990 historical transactions
+3. Ranks every account by total transaction count
+4. Classifies the top 5% (≥144 txs) as whales — **187 accounts** out of 3,686
+
+**Why transaction count, not XRP volume?**
+The dataset is almost entirely token-based (no native XRP payments), so XRP volume is near-zero for most accounts. Transaction count is the most reliable activity signal.
+
+**Per-account stats tracked:**
+
+| Stat | Description |
+|------|-------------|
+| `tx_count` | Total number of transactions |
+| `xrp_sent` | Total native XRP sent |
+| `xrp_received` | Total native XRP received |
+| `unique_destinations` | Number of distinct destination addresses |
+| `tx_types` | Breakdown by transaction type (e.g. `{"Payment": 35394}`) |
+| `tokens_traded` | Set of token currencies this account interacted with |
+| `percentile` | Account's rank within the full population (0–1) |
+| `is_whale` | Boolean — true if in top 5% by tx count |
+
+**API:**
+```python
+registry = WhaleRegistry.build()
+registry.is_whale("rXXX...")       # True / False
+registry.get_stats("rXXX...")      # AccountStats dataclass
+registry.percentile("rXXX...")     # 0.0 – 1.0
+registry.whale_accounts            # set of all whale addresses
+registry.summary()                 # {"total_accounts": 3686, "whale_accounts": 187, ...}
+```
+
+---
+
 ## Alert Engine *(in progress)*
 
 The alert engine sits on top of the scored stream and translates `risk_score` + raw transaction fields into named, human-readable alerts for retail traders. Each alert combines a rule-based trigger with the ML anomaly score as a confidence signal.
@@ -210,6 +249,7 @@ An account is classified as a **whale** if it falls in the **top 5% by total tra
 ├── demo.py                      # Colour-coded terminal demo
 ├── xrpl_historical.py           # Load historical CSV → normalised CSV
 ├── xrpl_realtime.py             # Stream live transactions → raw CSV
+├── whale_registry.py            # Identifies whale accounts from historical data
 ├── alert_engine.py              # ← IN PROGRESS: named alerts from scored stream
 ├── api.py                       # ← PLANNED: Flask REST API
 ├── telegram_bot.py              # ← PLANNED: Telegram alert bot
@@ -291,6 +331,7 @@ FLASK_PORT=4000
 - [x] Feature engineering (12 features)
 - [x] Isolation Forest model training
 - [x] Realtime transaction scoring
+- [x] Whale registry (identifies top 5% accounts)
 - [ ] Alert engine (15 alert types)
 - [ ] Flask REST API
 - [ ] Telegram bot notifications

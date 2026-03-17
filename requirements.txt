@@ -1,3 +1,6 @@
 xrpl-py
 websockets>=13
 pandas
+numpy
+scikit-learn
+joblib

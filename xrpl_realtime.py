@@ -69,7 +69,7 @@ async def stream():
             # Each websocket message wraps the transaction inside a
             # "transaction" key. Skip messages that aren't transactions
             # (e.g. subscription confirmations).
-            tx = msg.get("transaction")
+            tx = msg.get("tx_json") or msg.get("transaction")
             if tx is None:
                 continue
 
@@ -80,7 +80,7 @@ async def stream():
             raw = {
                 **tx,
                 "ledger_index": msg.get("ledger_index", tx.get("ledger_index")),
-                "ledger_close_time_human": msg.get("date"),
+                "ledger_close_time_human": msg.get("close_time_iso") or msg.get("date"),
                 "hash": msg.get("hash") or tx.get("hash"),
             }
 

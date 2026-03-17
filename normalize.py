@@ -71,8 +71,10 @@ def _parse_amount(raw) -> tuple[float | None, str, str | None]:
 
 
 def _pick_amount(row: dict):
-    """Choose the best amount field depending on transaction type."""
-    for field in ("amount", "deliver_max", "taker_gets"):
+    """Choose the best amount field depending on transaction type.
+    Checks both snake_case (CSV) and PascalCase (websocket) field names."""
+    for field in ("amount", "Amount", "deliver_max", "DeliverMax",
+                  "taker_gets", "TakerGets"):
         val = row.get(field)
         if val is not None and not (isinstance(val, float) and math.isnan(val)):
             return val

@@ -10,7 +10,7 @@ Architecture:
         ├── TransactionBuffer — 10-min rolling window + cooldowns
         └── Detectors (one per alert group)
             ├── Group 1: Size & Whale Movements
-            ├── Group 2: Burst & Bot Activity        [coming soon]
+            ├── Group 2: Burst & Bot Activity
             ├── Group 3: DEX & Trading Activity      [coming soon]
             ├── Group 4: Memo & Spam Detection       [coming soon]
             └── Group 5: Account Behaviour Shifts    [coming soon]
@@ -44,10 +44,15 @@ from transaction_buffer import TransactionBuffer
 # Thresholds  (will be user-configurable in the final product)
 # ---------------------------------------------------------------------------
 
+# Group 1
 LARGE_TX_PERCENTILE     = 0.99   # tx_size_percentile above which a tx is "large"
 VOLUME_SPIKE_RATIO      = 3.0    # volume_spike_ratio above which we alert
 HIGH_RISK_THRESHOLD     = 0.8    # risk_score above which we fire HIGH_RISK_TRANSACTION
 CRITICAL_RISK_THRESHOLD = 0.9    # risk_score above which severity is critical
+
+# Group 2
+BURST_TX_COUNT          = 50     # rolling_tx_count_5m above which we fire TRANSACTION_BURST
+BURST_Z_SCORE           = 3.0    # tx_rate_z_score above which we fire ABNORMAL_TX_RATE
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +158,11 @@ class AlertEngine:
         alerts += self._check_volume_spike(scored_tx)
         alerts += self._check_high_risk(scored_tx)
 
-        # Groups 2–5 will be added here in subsequent steps
+        # Group 2 — Burst & Bot Activity
+        alerts += self._check_transaction_burst(scored_tx)
+        alerts += self._check_abnormal_tx_rate(scored_tx)
+
+        # Groups 3–5 will be added here in subsequent steps
 
         return alerts
 
@@ -312,4 +321,110 @@ class AlertEngine:
         )
 
         self.buffer.set_cooldown(account, "HIGH_RISK_TRANSACTION")
+        return [alert]
+
+    # ── Group 2: Burst & Bot Activity ────────────────────────────────────
+
+    def _check_transaction_burst(self, tx: dict) -> list[Alert]:
+        """
+        TRANSACTION_BURST — a whale is sending an abnormally high number of
+        transactions in a short window.
+
+        Fires when:
+          - Account is a known whale
+          - rolling_tx_count_5m >= BURST_TX_COUNT (50 txs in 5 min)
+          - Not on cooldown
+
+        Uses the rolling_tx_count_5m feature computed by the ML pipeline,
+        which counts how many transactions this account sent in the last 5 min.
+        This is a strong signal for bots, wash trading, or market manipulation.
+        """
+        account  = tx.get("account", "")
+        tx_count = float(tx.get("rolling_tx_count_5m") or 0)
+        risk     = float(tx.get("risk_score") or 0)
+        anomaly  = int(tx.get("is_anomaly") or 0)
+
+        if not self.registry.is_whale(account):
+            return []
+        if tx_count < BURST_TX_COUNT:
+            return []
+        if self.buffer.is_on_cooldown(account, "TRANSACTION_BURST"):
+            return []
+
+        severity = _severity(risk, anomaly)
+        message = (
+            f"⚡ Whale burst: {int(tx_count)} transactions in 5 min "
+            f"from {account[:12]}..."
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="TRANSACTION_BURST",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "rolling_tx_count_5m": int(tx_count),
+                "burst_threshold": BURST_TX_COUNT,
+                "tx_per_minute": float(tx.get("tx_per_minute") or 0),
+            },
+        )
+
+        self.buffer.set_cooldown(account, "TRANSACTION_BURST")
+        return [alert]
+
+    def _check_abnormal_tx_rate(self, tx: dict) -> list[Alert]:
+        """
+        ABNORMAL_TX_RATE — a whale's transaction rate is statistically extreme
+        compared to all other accounts in the dataset.
+
+        Fires when:
+          - Account is a known whale
+          - tx_rate_z_score >= BURST_Z_SCORE (3.0 standard deviations above mean)
+          - Not on cooldown
+
+        tx_rate_z_score is computed by the ML pipeline as:
+            (account_tx_per_minute - network_mean) / network_std
+        A z-score of 3.0 means the account is sending transactions at a rate
+        that only ~0.1% of accounts would reach by chance.
+        """
+        account = tx.get("account", "")
+        z_score = float(tx.get("tx_rate_z_score") or 0)
+        rate    = float(tx.get("tx_per_minute") or 0)
+        risk    = float(tx.get("risk_score") or 0)
+        anomaly = int(tx.get("is_anomaly") or 0)
+
+        if not self.registry.is_whale(account):
+            return []
+        if z_score < BURST_Z_SCORE:
+            return []
+        if self.buffer.is_on_cooldown(account, "ABNORMAL_TX_RATE"):
+            return []
+
+        severity = _severity(risk, anomaly)
+        message = (
+            f"🤖 Abnormal tx rate: {account[:12]}... sending at "
+            f"{rate:.1f} tx/min — {z_score:.1f}× above network average"
+        )
+
+        alert = Alert(
+            id=_make_id(account),
+            timestamp=_now_iso(),
+            account=account,
+            alert_type="ABNORMAL_TX_RATE",
+            severity=severity,
+            risk_score=risk,
+            is_anomaly=anomaly,
+            message=message,
+            details={
+                "tx_rate_z_score": round(z_score, 3),
+                "tx_per_minute": round(rate, 2),
+                "z_score_threshold": BURST_Z_SCORE,
+            },
+        )
+
+        self.buffer.set_cooldown(account, "ABNORMAL_TX_RATE")
         return [alert]

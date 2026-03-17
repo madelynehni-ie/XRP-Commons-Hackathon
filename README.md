@@ -146,6 +146,64 @@ registry.summary()                 # {"total_accounts": 3686, "whale_accounts": 
 
 ---
 
+## Transaction Buffer (`transaction_buffer.py`)
+
+The alert engine needs memory. A single transaction in isolation tells you very little — but 340 transactions from the same account in 10 minutes tells you a lot. The `TransactionBuffer` is the sliding-window state layer that makes time-based alerts possible.
+
+**How it works:**
+
+Every scored transaction gets passed to `buffer.add()`. The buffer keeps the last 10 minutes of transactions in memory and automatically discards anything older. Alert detectors then query the buffer to get a snapshot of what an account or the network has been doing recently.
+
+**Rolling window:** 10 minutes (600 seconds)
+**Cooldown period:** 2 minutes per alert type per account (prevents alert spam)
+
+### AccountState
+
+When an alert detector calls `buffer.get_account_state("rXXX...")`, it gets back an `AccountState` snapshot containing everything known about that account within the current window:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `tx_count` | int | Number of transactions in the window |
+| `xrp_out` | float | Total XRP sent in the window |
+| `xrp_in` | float | Total XRP received as destination in the window |
+| `net_xrp` | float | `xrp_in - xrp_out` — positive = net receiver, negative = net sender |
+| `offer_creates` | int | Number of OfferCreate transactions in the window |
+| `offer_cancels` | int | Number of OfferCancel transactions in the window |
+| `offer_cancel_ratio` | float | `cancels / (creates + cancels)` — high ratio signals spoofing |
+| `tx_types` | dict | Breakdown by type e.g. `{"Payment": 5, "OfferCreate": 12}` |
+| `memo_texts` | list | Decoded memo strings seen in the window |
+| `risk_scores` | list | ML risk score for each transaction in the window |
+| `avg_risk_score` | float | Mean ML risk score across the window |
+| `max_risk_score` | float | Highest ML risk score seen in the window |
+| `tokens` | dict | Per-token buy/sell counts e.g. `{"SOLO": {"buys": 3, "sells": 0}}` |
+| `last_seen` | datetime | Timestamp of the most recent transaction |
+
+### NetworkState
+
+`buffer.get_network_state()` returns a network-wide snapshot across all accounts in the window — used for detecting network-level anomalies like volume spikes:
+
+| Field | Description |
+|-------|-------------|
+| `tx_count` | Total transactions in the window |
+| `active_accounts` | Number of distinct accounts seen |
+| `total_xrp_volume` | Total XRP moved across all accounts |
+| `avg_risk_score` | Mean ML risk score across the window |
+| `anomaly_count` | Transactions flagged `is_anomaly=1` by the model |
+
+### Cooldown System
+
+Without a cooldown, a whale account sending 1,000 transactions in a burst would generate 1,000 `TRANSACTION_BURST` alerts. The cooldown tracker prevents the same alert type from firing for the same account more than once every 2 minutes.
+
+```python
+if not buffer.is_on_cooldown(account, "TRANSACTION_BURST"):
+    buffer.set_cooldown(account, "TRANSACTION_BURST")
+    # fire the alert — next one for this account won't fire for 2 minutes
+```
+
+Cooldown periods will be user-configurable in the final product so traders can tune how frequently they receive each alert type.
+
+---
+
 ## Alert Engine *(in progress)*
 
 The alert engine sits on top of the scored stream and translates `risk_score` + raw transaction fields into named, human-readable alerts for retail traders. Each alert combines a rule-based trigger with the ML anomaly score as a confidence signal.
@@ -250,6 +308,7 @@ An account is classified as a **whale** if it falls in the **top 5% by total tra
 ├── xrpl_historical.py           # Load historical CSV → normalised CSV
 ├── xrpl_realtime.py             # Stream live transactions → raw CSV
 ├── whale_registry.py            # Identifies whale accounts from historical data
+├── transaction_buffer.py        # 10-min rolling window + per-account state + cooldowns
 ├── alert_engine.py              # ← IN PROGRESS: named alerts from scored stream
 ├── api.py                       # ← PLANNED: Flask REST API
 ├── telegram_bot.py              # ← PLANNED: Telegram alert bot
@@ -332,6 +391,7 @@ FLASK_PORT=4000
 - [x] Isolation Forest model training
 - [x] Realtime transaction scoring
 - [x] Whale registry (identifies top 5% accounts)
+- [x] Transaction buffer (10-min rolling window, per-account state, cooldowns)
 - [ ] Alert engine (15 alert types)
 - [ ] Flask REST API
 - [ ] Telegram bot notifications

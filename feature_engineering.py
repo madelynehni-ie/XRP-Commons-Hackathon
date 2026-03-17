@@ -24,7 +24,8 @@ from normalize import _parse_amount, _pick_amount, normalize_transaction
 # Constants
 # ---------------------------------------------------------------------------
 
-RAW_CSV = "ie_dataset/transactions.csv"
+_FALLBACK_CSV = "/Users/artemabesadze/Desktop/XRPL Commons Work/XRPL_ML_WhaleProject/ie_dataset/transactions.csv"
+RAW_CSV = "ie_dataset/transactions.csv" if __import__("os").path.exists("ie_dataset/transactions.csv") else _FALLBACK_CSV
 OUTPUT_CSV = "data/featured_transactions.csv"
 
 FEATURE_COLUMNS = [

@@ -32,6 +32,10 @@ from xrpl.models.requests import Subscribe
 
 from model import load_model, FEATURE_COLUMNS, score_transactions
 from normalize import normalize_transaction
+from whale_registry import WhaleRegistry
+from transaction_buffer import TransactionBuffer
+from alert_engine import AlertEngine
+from alerts_writer import write_alert
 
 # ---------------------------------------------------------------------------
 # Config
@@ -319,9 +323,19 @@ async def stream_and_score(model, stats):
 
             _append_scored_row(scored_row)
 
+            # --- Step 6: Run alert engine ---
+            fired_alerts = _alert_engine.process_transaction(scored_row)
+            for alert in fired_alerts:
+                write_alert(alert)
+                sev_colours = {"low": "\033[93m", "medium": "\033[93m",
+                               "high": "\033[91m", "critical": "\033[95m"}
+                col = sev_colours.get(alert.severity, "")
+                print(f"  🚨 {col}[{alert.severity.upper()}]\033[0m "
+                      f"{alert.alert_type} — {alert.message}")
+
             count += 1
             # Color-code: red for anomalies, green for normal
-            risk_label = "ANOMALY" if is_anomaly else "normal "
+            risk_label = "\033[91mANOMALY\033[0m" if is_anomaly else "normal "
             print(
                 f"[{count:>5}] "
                 f"{risk_label}  "
@@ -343,6 +357,13 @@ if __name__ == "__main__":
 
     # Load historical stats for feature computation
     stats = _load_historical_stats()
+
+    # Build whale registry and alert engine
+    print("Building whale registry...")
+    _whale_registry = WhaleRegistry.build(verbose=False)
+    _tx_buffer = TransactionBuffer()
+    _alert_engine = AlertEngine(_whale_registry, _tx_buffer)
+    print(f"  {len(_whale_registry.whale_accounts)} whales identified\n")
 
     # Set up the output CSV
     _init_csv()

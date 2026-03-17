@@ -2,3 +2,5 @@ ie_dataset/
 ie_dataset.zip
 data/
 __pycache__/
+transactions.csv
+.DS_Store

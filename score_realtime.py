@@ -36,6 +36,7 @@ from whale_registry import WhaleRegistry
 from transaction_buffer import TransactionBuffer
 from alert_engine import AlertEngine
 from alerts_writer import write_alert
+from supabase_uploader import init_supabase, upload_scored_row
 
 # ---------------------------------------------------------------------------
 # Config
@@ -263,7 +264,7 @@ def _append_scored_row(row: dict):
 # Main streaming + scoring loop
 # ---------------------------------------------------------------------------
 
-async def stream_and_score(model, stats):
+async def stream_and_score(model, stats, supabase_client=None):
     """Connect to the XRPL websocket, stream transactions, and score each one.
 
     For each incoming transaction:
@@ -322,6 +323,7 @@ async def stream_and_score(model, stats):
             }
 
             _append_scored_row(scored_row)
+            upload_scored_row(supabase_client, scored_row)
 
             # --- Step 6: Run alert engine ---
             fired_alerts = _alert_engine.process_transaction(scored_row)
@@ -365,12 +367,15 @@ if __name__ == "__main__":
     _alert_engine = AlertEngine(_whale_registry, _tx_buffer)
     print(f"  {len(_whale_registry.whale_accounts)} whales identified\n")
 
-    # Set up the output CSV
+    # Set up outputs: CSV + Supabase
     _init_csv()
+    supabase_client = init_supabase()
     print(f"Scoring live transactions → {OUT_PATH}")
+    if supabase_client:
+        print("Also uploading to Supabase.")
     print("Press Ctrl+C to stop.\n")
 
     try:
-        asyncio.run(stream_and_score(model, stats))
+        asyncio.run(stream_and_score(model, stats, supabase_client))
     except KeyboardInterrupt:
         print(f"\nStopped. Scored data saved in {OUT_PATH}")
